@@ -1,0 +1,6 @@
+[LOAD] rows in = 87924
+[R1/R2/R3] malformed payment_id=40, sentinel user rows=40, union removed=40
+[R1] removed rows whose base id exists as a valid payment: 40/40
+[REMOVE] rows out = 87884 (removed 40)
+[WRITE] /sessions/rcw-01pyngfm83zwvzpgezwsydwc/mnt/payments/payments_clean.csv
+[REVENUE] gross(amount_usd)=6389866.00  net(net_amount_usd)=6274863.00
