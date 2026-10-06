@@ -1,0 +1,489 @@
+# Semantic layer for the course subscription database (coursera_capstone, PostgreSQL via MCP).
+# Single source of truth for tables, joins, dimensions and KPI definitions.
+# KPI SQL matches metrics.py (dashboard) and the agent's instructions in agent.py.
+
+version: 1
+database:
+  name: coursera_capstone
+  engine: postgresql
+  access: read-only via MCP server (@modelcontextprotocol/server-postgres)
+  schema: public
+
+conventions:
+  as_of_date:
+    description: >
+      The data ends in Feb 2023, so "now" is the last payment date, not today.
+      All "current", "recent" and "last N days" logic is relative to this date.
+    sql: (select max(paid_at) from payments)   # = 2023-02-26
+  currency: USD
+  partial_periods: Feb 2023 is a partial month (data ends on the 26th).
+  plan_prices:
+    monthly: 49
+    annual: 399
+
+# ---------------------------------------------------------------------------
+# Tables (entities)
+# ---------------------------------------------------------------------------
+tables:
+  users:
+    description: One row per registered user with profile attributes.
+    grain: user
+    primary_key: user_id
+    rows: 40000
+    columns:
+      user_id: {type: varchar, description: User identifier}
+      signup_date: {type: date}
+      plan: {type: varchar, values: [monthly, annual, free, financial_aid], description: Current plan}
+      persona: {type: varchar, values: [upskiller, career_switcher, student, hobbyist]}
+      age_band: {type: varchar, values: ["18-24", "25-34", "35-44", "45+"]}
+      country: {type: varchar, description: "19 values; mixes names and codes (see data_quality)"}
+      device_primary: {type: varchar, values: [desktop, mobile, tablet]}
+
+  payments:
+    description: One row per subscription charge. Only monthly and annual plans pay.
+    grain: payment
+    primary_key: payment_id
+    rows: 87924
+    time_column: paid_at
+    date_range: [2021-01-01, 2023-02-26]
+    columns:
+      payment_id: {type: varchar}
+      user_id: {type: varchar, foreign_key: users.user_id}
+      paid_at: {type: date}
+      amount_usd: {type: numeric, description: "49 for monthly, 399 for annual"}
+      plan: {type: varchar, values: [monthly, annual]}
+      is_refunded: {type: integer, values: [0, 1], description: 1 = payment was refunded}
+
+  enrollments:
+    description: One row per user enrolled in a course, with progress and funnel stage.
+    grain: user x course enrollment
+    primary_key: enrollment_id
+    rows: 94705
+    columns:
+      enrollment_id: {type: varchar}
+      user_id: {type: varchar, foreign_key: users.user_id}
+      course_id: {type: varchar, foreign_key: dim_course.course_id}
+      course_url: {type: text, foreign_key: dim_course.course_url}
+      specialization_id: {type: varchar, foreign_key: dim_course.spec_id}
+      course_no: {type: integer, description: Position of the course in its specialization}
+      enrolled_at: {type: text, description: "Date as text: 'YYYY-MM-DD' or 'DD.MM.YYYY'"}
+      completed_at: {type: text, description: "'YYYY-MM-DD' or NULL if not completed"}
+      last_week_reached: {type: integer}
+      n_weeks: {type: integer}
+      progress_pct: {type: numeric, description: "0-100 (a few rows slightly above 100)"}
+      funnel_state:
+        type: varchar
+        values: [registered, viewed, explored, certified]
+        description: "Ordered funnel: registered -> viewed -> explored -> certified"
+      is_certified: {type: integer, values: [0, 1]}
+
+  weekly_activity:
+    description: Learning activity per enrollment per course week.
+    grain: enrollment x week_number
+    primary_key: [enrollment_id, week_number]
+    rows: 84618
+    time_column: active_date
+    date_range: [2021-01-02, 2023-05-05]
+    columns:
+      enrollment_id: {type: varchar, foreign_key: enrollments.enrollment_id}
+      week_number: {type: integer}
+      active_date: {type: date}
+      minutes_watched: {type: numeric}
+      quiz_attempts: {type: integer}
+      quiz_score: {type: numeric}
+
+  dim_course:
+    description: Course dimension with catalog attributes and rating aggregates.
+    grain: course
+    primary_key: course_id
+    unique_keys: [course_url]
+    rows: 3032
+    columns:
+      course_id: {type: varchar}
+      course_url: {type: text}
+      course: {type: text, description: Course title}
+      domain: {type: text, description: "Subject area, 99 values"}
+      level: {type: varchar, values: [Beginner, Intermediate, Advanced, Unknown]}
+      partner: {type: text, description: University / company offering the course}
+      spec_id: {type: varchar, description: Specialization identifier}
+      specialization_url: {type: text, foreign_key: specializations.specialization_url}
+      specialization_name: {type: text}
+      n_weeks: {type: integer}
+      total_minutes: {type: numeric}
+      review_score: {type: numeric}
+      n_reviews: {type: numeric}
+      mean_stars: {type: numeric}
+      pct_low: {type: numeric, description: Share of low-star reviews}
+
+  reviews:
+    description: Public course reviews (text + stars).
+    grain: review
+    primary_key: review_id
+    rows: 158467
+    columns:
+      review_id: {type: varchar}
+      course_url: {type: text, foreign_key: dim_course.course_url}
+      review_date: {type: text, description: "Text like 'Aug 1, 2022'; cast with to_date(review_date, 'Mon DD, YYYY')"}
+      review_content: {type: text}
+      stars: {type: integer, values: [1, 2, 3, 4, 5]}
+
+  review_link:
+    description: Bridge linking a subset of reviews (811) to the enrollment that wrote them.
+    grain: enrollment x review
+    primary_key: [enrollment_id, review_id]
+    columns:
+      enrollment_id: {type: varchar, foreign_key: enrollments.enrollment_id}
+      review_id: {type: varchar, foreign_key: reviews.review_id}
+
+  specializations:
+    description: Specialization (multi-course program) catalog.
+    grain: specialization
+    primary_key: specialization_url
+    rows: 728
+    columns:
+      specialization_url: {type: text}
+      specialization_name: {type: text}
+      specialization_instructors: {type: text}
+      review_score: {type: numeric}
+      skills: {type: text}
+
+  specialization_content:
+    description: Courses listed inside each specialization.
+    grain: specialization x course
+    columns:
+      specialization_url: {type: text, foreign_key: specializations.specialization_url}
+      course_url: {type: text, foreign_key: dim_course.course_url}
+      course_no: {type: integer}
+
+  courses_content:
+    description: Week-level syllabus of each course.
+    grain: course x week (32 duplicate rows)
+    columns:
+      course_url: {type: text, foreign_key: dim_course.course_url}
+      week_no: {type: integer}
+      week_name: {type: text}
+
+  weeks_content:
+    description: Materials (videos, readings, practice) inside each course week.
+    grain: course x week x material
+    columns:
+      course_url: {type: text, foreign_key: dim_course.course_url}
+      week_no: {type: integer}
+      material_type: {type: text, values: [video, videos, reading, readings, practice]}
+      material_name: {type: text}
+
+# ---------------------------------------------------------------------------
+# Relationships (joins). Cardinality is from the left table to the right table.
+# ---------------------------------------------------------------------------
+relationships:
+  - name: payments_to_users
+    from: payments.user_id
+    to: users.user_id
+    cardinality: many_to_one
+    join: left
+    note: 40 payments have no matching user; use a LEFT JOIN when totals must match payments.
+  - name: enrollments_to_users
+    from: enrollments.user_id
+    to: users.user_id
+    cardinality: many_to_one
+  - name: enrollments_to_courses
+    from: enrollments.course_id
+    to: dim_course.course_id
+    cardinality: many_to_one
+    note: 100% of enrollments match a course.
+  - name: weekly_activity_to_enrollments
+    from: weekly_activity.enrollment_id
+    to: enrollments.enrollment_id
+    cardinality: many_to_one
+    note: To get activity per user, go weekly_activity -> enrollments -> users.
+  - name: reviews_to_courses
+    from: reviews.course_url
+    to: dim_course.course_url
+    cardinality: many_to_one
+  - name: review_link_to_enrollments
+    from: review_link.enrollment_id
+    to: enrollments.enrollment_id
+    cardinality: many_to_one
+  - name: review_link_to_reviews
+    from: review_link.review_id
+    to: reviews.review_id
+    cardinality: many_to_one
+  - name: courses_to_specializations
+    from: dim_course.specialization_url
+    to: specializations.specialization_url
+    cardinality: many_to_one
+  - name: specialization_content_to_specializations
+    from: specialization_content.specialization_url
+    to: specializations.specialization_url
+    cardinality: many_to_one
+  - name: specialization_content_to_courses
+    from: specialization_content.course_url
+    to: dim_course.course_url
+    cardinality: many_to_one
+  - name: courses_content_to_courses
+    from: courses_content.course_url
+    to: dim_course.course_url
+    cardinality: many_to_one
+  - name: weeks_content_to_courses
+    from: weeks_content.course_url
+    to: dim_course.course_url
+    cardinality: many_to_one
+
+join_rules:
+  - Revenue is per user, not per course. Never attribute payments to courses by joining
+    payments -> enrollments; it duplicates revenue for users with several enrollments.
+  - Aggregate weekly_activity to enrollment or user level before joining to payments.
+  - Use payments.plan (not users.plan) for revenue by plan.
+
+# ---------------------------------------------------------------------------
+# Dimensions used for segmentation
+# ---------------------------------------------------------------------------
+dimensions:
+  plan: {table: payments, sql: payments.plan, note: "users.plan also has free / financial_aid"}
+  persona: {table: users, sql: users.persona}
+  age_band: {table: users, sql: users.age_band}
+  device_primary: {table: users, sql: users.device_primary}
+  country:
+    table: users
+    description: Normalized country name
+    sql: >
+      case users.country when 'USA' then 'United States' when 'DE' then 'Germany'
+      when 'UK' then 'United Kingdom' else coalesce(users.country, 'Unknown') end
+  course_domain: {table: dim_course, sql: dim_course.domain}
+  course_level: {table: dim_course, sql: dim_course.level}
+  funnel_state: {table: enrollments, sql: enrollments.funnel_state}
+  month:
+    description: Calendar month of a payment
+    sql: to_char(date_trunc('month', payments.paid_at), 'YYYY-MM')
+  enrolled_date:
+    description: enrolled_at parsed from both text formats
+    sql: >
+      case when enrollments.enrolled_at like '__.__.____'
+           then to_date(enrollments.enrolled_at, 'DD.MM.YYYY')
+           else enrollments.enrolled_at::date end
+
+# ---------------------------------------------------------------------------
+# Reusable filters / segments
+# ---------------------------------------------------------------------------
+segments:
+  net_payments:
+    description: Payments that were not refunded
+    sql: payments.is_refunded = 0
+  paying_now:
+    description: >
+      Users currently paying: a non-refunded monthly payment in the last 35 days, or a
+      non-refunded annual payment in the last 12 months (relative to as_of_date).
+    sql: |
+      select user_id, max(plan) as plan, max(paid_at) as last_paid
+      from payments
+      where is_refunded = 0
+        and ((plan = 'monthly' and paid_at > {as_of_date} - 35)
+          or (plan = 'annual'  and paid_at > {as_of_date} - interval '12 months'))
+      group by user_id
+
+# ---------------------------------------------------------------------------
+# KPIs
+# ---------------------------------------------------------------------------
+kpis:
+  net_revenue:
+    label: Net revenue
+    description: Total revenue excluding refunded payments.
+    format: currency
+    sql: sum(amount_usd) filter (where is_refunded = 0)
+    tables: [payments]
+
+  gross_revenue:
+    label: Gross revenue
+    format: currency
+    sql: sum(amount_usd)
+    tables: [payments]
+
+  mrr:
+    label: MRR (monthly recurring revenue)
+    description: >
+      Monthly-plan net revenue in the last full month before as_of_date, plus annual-plan
+      net revenue from the 12 months ending with that month divided by 12.
+    format: currency
+    tables: [payments]
+    sql: |
+      with m as (select date_trunc('month', {as_of_date}) - interval '1 month' as m0)
+      select
+        (select coalesce(sum(amount_usd), 0) from payments, m
+          where is_refunded = 0 and plan = 'monthly' and date_trunc('month', paid_at) = m0)
+      + (select coalesce(sum(amount_usd), 0) from payments, m
+          where is_refunded = 0 and plan = 'annual'
+            and paid_at >= m0 - interval '11 months' and paid_at < m0 + interval '1 month') / 12
+
+  arr:
+    label: ARR (annual recurring revenue)
+    format: currency
+    formula: mrr * 12
+
+  paying_users:
+    label: Paying users
+    sql: count(distinct user_id) filter (where is_refunded = 0)
+    tables: [payments]
+
+  arpu:
+    label: ARPU (average revenue per user)
+    description: Lifetime net revenue per paying user.
+    format: currency
+    formula: net_revenue / paying_users
+
+  ltv_proxy:
+    label: LTV proxy
+    description: Average number of non-refunded payments per user x plan price, per plan.
+    format: currency
+    group_by: [plan]
+    tables: [payments]
+    sql: |
+      select plan,
+             count(*)::float8 / count(distinct user_id) * max(amount_usd) as ltv_proxy
+      from payments where is_refunded = 0
+      group by plan
+
+  churn_rate_monthly_plan:
+    label: Churn rate - monthly plan
+    description: >
+      Share of users who paid for the monthly plan in month M-1 but not in month M.
+      Only fully observed months are included. Headline value = churned / active over the
+      last 12 observed months.
+    format: percent
+    grain: month
+    tables: [payments]
+    sql: |
+      with um as (
+        select distinct user_id, date_trunc('month', paid_at)::date as m
+        from payments where plan = 'monthly'
+      )
+      select to_char(a.m + interval '1 month', 'YYYY-MM') as month,
+             count(*) as active_start,
+             count(*) filter (where b.user_id is null) as churned,
+             avg((b.user_id is null)::int) as churn_rate
+      from um a
+      left join um b on b.user_id = a.user_id and b.m = a.m + interval '1 month'
+      where a.m + interval '1 month' < date_trunc('month', {as_of_date})
+      group by a.m order by a.m
+
+  churn_rate_annual_plan:
+    label: Churn rate - annual plan
+    description: >
+      Share of annual payments whose renewal date (paid_at + 12 months) has passed with
+      no new annual payment within 13 months (1 month grace). Grouped by renewal month.
+    format: percent
+    grain: month
+    tables: [payments]
+    sql: |
+      with ap as (select user_id, paid_at from payments where plan = 'annual'),
+      due as (
+        select a.user_id, (a.paid_at + interval '12 months')::date as due_date,
+               exists (select 1 from ap b where b.user_id = a.user_id and b.paid_at > a.paid_at
+                         and b.paid_at <= a.paid_at + interval '13 months') as renewed
+        from ap a
+      )
+      select to_char(date_trunc('month', due_date), 'YYYY-MM') as month,
+             count(*) as due, count(*) filter (where not renewed) as churned,
+             avg((not renewed)::int) as churn_rate
+      from due where due_date + interval '1 month' <= {as_of_date}
+      group by 1 order by 1
+
+  avg_subscriber_lifespan:
+    label: Average subscriber lifespan (months)
+    description: >
+      Monthly plan: months between first and last payment + 1. Annual plan: payments x 12.
+      Observed lifespan, so still-active subscribers are included (right-censored).
+    format: number
+    group_by: [plan]
+    tables: [payments]
+    sql: |
+      select plan,
+             avg(case when plan = 'annual' then n * 12
+                      else extract(year from age(last_paid, first_paid)) * 12
+                           + extract(month from age(last_paid, first_paid)) + 1 end) as avg_months
+      from (select user_id, plan, min(paid_at) as first_paid, max(paid_at) as last_paid,
+                   count(*) as n
+            from payments group by 1, 2) x
+      group by plan
+
+  refund_rate:
+    label: Refund rate
+    description: Refunded payments / all payments (count based).
+    format: percent
+    sql: avg(is_refunded)
+    tables: [payments]
+    breakdowns: [plan, persona, country, device_primary, age_band]
+
+  refund_rate_usd:
+    label: Refund rate ($)
+    description: Refunded amount / gross amount.
+    format: percent
+    sql: sum(amount_usd) filter (where is_refunded = 1) / sum(amount_usd)
+    tables: [payments]
+
+  at_risk_paying_subscribers:
+    label: At-risk-but-paying subscribers
+    description: >
+      Users in segment paying_now who watched less than 30 minutes in total in the
+      28 days before as_of_date (no activity counts as 0).
+    format: count
+    tables: [payments, weekly_activity, enrollments, users]
+    parameters: {min_minutes: 30, window_days: 28}
+    sql: |
+      with paying as ({paying_now}),
+      recent as (
+        select e.user_id, sum(w.minutes_watched) as minutes_28d
+        from weekly_activity w join enrollments e using (enrollment_id)
+        where w.active_date > {as_of_date} - 28 and w.active_date <= {as_of_date}
+        group by e.user_id
+      )
+      select count(*)
+      from paying p
+      join users u using (user_id)          -- drops 1 payer whose user_id is missing from users
+      left join recent r using (user_id)
+      where coalesce(r.minutes_28d, 0) < 30
+
+  stalled_progress_payers:
+    label: Stalled-progress payers
+    description: >
+      Users in segment paying_now with at least one enrollment that is not completed,
+      still in funnel_state registered/viewed, progress_pct < 50, enrolled 28+ days before
+      as_of_date and with no weekly activity in the last 28 days.
+    format: count
+    tables: [enrollments, payments, weekly_activity]
+    parameters: {max_progress_pct: 50, inactive_days: 28}
+    sql: |
+      with paying as ({paying_now}),
+      last_act as (select enrollment_id, max(active_date) as last_active
+                   from weekly_activity group by 1)
+      select count(distinct e.user_id)
+      from enrollments e
+      join paying p using (user_id)
+      left join last_act l using (enrollment_id)
+      where e.completed_at is null
+        and e.funnel_state in ('registered', 'viewed')
+        and e.progress_pct < 50
+        and {enrolled_date} <= {as_of_date} - 28
+        and (l.last_active is null or l.last_active <= {as_of_date} - 28)
+
+  completion_rate:
+    label: Course completion rate
+    description: Share of enrollments that reached funnel_state = certified.
+    format: percent
+    sql: avg((funnel_state = 'certified')::int)
+    tables: [enrollments]
+    breakdowns: [course_domain, course_level]
+
+# ---------------------------------------------------------------------------
+# Known data-quality issues
+# ---------------------------------------------------------------------------
+data_quality:
+  - users.country mixes 'USA'/'United States', 'DE'/'Germany', 'UK'/'United Kingdom' and has 800 NULLs.
+    Use the normalized country dimension.
+  - enrollments.enrolled_at is text in two formats (3,786 rows use DD.MM.YYYY). Use the enrolled_date dimension.
+  - 40 payments reference a user_id that does not exist in users.
+  - weekly_activity.minutes_watched has 169 negative values.
+  - enrollments.progress_pct can slightly exceed 100 (max 104).
+  - weekly_activity runs to 2023-05-05, after the last payment (2023-02-26).
+  - weeks_content.material_type has inconsistent values (video/videos, reading/readings).
+  - courses_content has 32 duplicate (course_url, week_no) rows.
+  - reviews.review_date is text ('Aug 1, 2022').
